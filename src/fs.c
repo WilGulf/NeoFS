@@ -1,4 +1,5 @@
 #include "fs.h"
+#include "global.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,18 +10,21 @@ uint32_t BLOCK_SIZE = 0;
 uint32_t DATA_SIZE = 0;
 
 int get_master_block(struct master_block *out, FILE *disk) {
+    printfv("Reading masterblock.\n");
     fseek(disk, 0, SEEK_SET);
     fread(out, 1, sizeof(struct master_block), disk);
     return 0;
 }
 
 int get_meta_block(uint32_t block, struct meta_block *out, FILE *disk) {
+    printfv("Reading metablock at %d.\n", block);
     fseek(disk, (BLOCK_SIZE * block), SEEK_SET);
     fread(out, 1, sizeof(struct meta_block), disk);
     return 0;
 }
 
 int get_block(uint32_t block, struct block *out, FILE *disk) {
+    printfv("Reading block at %d.\n", block);
     fseek(disk, (BLOCK_SIZE * block), SEEK_SET);
     fread(out, 1, sizeof(struct block), disk);
     return 0;
@@ -53,6 +57,7 @@ int get_free_block(uint32_t start, FILE *disk) {
         unsigned char mask = 1 << (bit % 8);
         if (!(buffer[bit / 8] & mask)) {
             free(buffer);
+            printfv("Found free block at %d.\n", bit);
             return bit;
         }
     }
@@ -74,8 +79,10 @@ int set_block_on_bitmap(uint32_t block, bool state, FILE *disk) {
     unsigned char mask = 1 << (block % 8);
     if (state) {
         buffer[block / 8] |= mask;
+        printfv("Marked block %d as used.\n", block);
     } else {
         buffer[block / 8] &= ~mask;
+        printfv("Marked block %d as free.\n", block);
     }
 
     write_file(master_block.bitmap_metablock, buffer, bitmap.size, disk);
@@ -86,12 +93,14 @@ int set_block_on_bitmap(uint32_t block, bool state, FILE *disk) {
 }
 
 int write_block(uint32_t block, void *val, size_t total, FILE *disk) {
+    printfv("Writing to block at %d.\n", block);
     fseek(disk, (BLOCK_SIZE * block), SEEK_SET);
     fwrite(val, 1, total, disk);
     return BLOCK_SIZE;
 }
 
 int read_block(uint32_t block, void *out, FILE *disk) {
+    printfv("Reading to block at %d.\n", block);
     int pos = (BLOCK_SIZE * block) + BLOCK_DATA_OFFSET;
     int to_read = BLOCK_SIZE - BLOCK_DATA_OFFSET;
 
@@ -117,10 +126,13 @@ int remove_meta_block(uint32_t block, FILE *disk) {
 }
 
 int fs_init(FILE *disk) {
+    printfv("Reading disk for filesystem information.\n");
+
     struct master_block master;
     get_master_block(&master, disk);
 
     if (master.magic != NEOFS_MAGIC) {
+        printf("ERROR: Magic of filesystem does not seem to match.\n");
         return -1;
     }
 

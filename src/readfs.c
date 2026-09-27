@@ -1,11 +1,11 @@
 #include "fs.h"
 #include "path.h"
+#include "global.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <memory.h>
-
 
 int main(int argc, char **argv) {
     if (argc > 3) {
@@ -25,6 +25,10 @@ int main(int argc, char **argv) {
 
         if (disk_found && !strstr(argv[i], "--")) {
             target_path = argv[i];
+        }
+
+        if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
+            verbose = true;
         }
     }
 

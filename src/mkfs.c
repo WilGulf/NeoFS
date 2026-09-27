@@ -6,6 +6,7 @@
 #include <memory.h>
 
 #include "fs.h"
+#include "global.h"
 
 #define DEFAULT_BLOCK_SIZE 1024
 
@@ -23,10 +24,24 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--block_size") && i + 1 < argc) {
             target_block_size = atoi(argv[++i]);
         }
+        
+        if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
+            verbose = true;
+        }
+    }
+
+    if (
+        target_block_size < (sizeof(struct block) + 64) ||
+        target_block_size < (sizeof(struct meta_block) + 64) ||
+        target_block_size < (sizeof(struct master_block) + 64)
+    ) {
+        printf("ERROR: Provided blocksize is too small to create a usable filesystem.\n");
+        return 0;
     }
 
     FILE *disk = fopen(disk_path, "rb+");
     if (!disk) {
+        printf("ERROR: Failed to open disk image.\n");
         return -1;
     }
 
@@ -42,13 +57,14 @@ int main(int argc, char **argv) {
     block_1.first_block = 1;
     block_1.magic = NEOFS_MAGIC;
     block_1.block_count = total_blocks;
-    printf("BLOCKS: %d\n", total_blocks);
+    printf("INFO: Total blocks on disk: %d.\n", total_blocks);
     block_1.block_size = BLOCK_SIZE;
     block_1.bitmap_metablock = 1;
 
     fseek(disk, 0, SEEK_SET);
     fwrite(&block_1, 1, sizeof(block_1), disk);
 
+    printf("INFO: Creating filesystem bitmap.\n");
     struct meta_block bitmap;
     memset(bitmap.filename, 0, sizeof(bitmap.filename));
     memset(bitmap.ext, 0, sizeof(bitmap.ext));
@@ -71,6 +87,7 @@ int main(int argc, char **argv) {
     set_block_on_bitmap(1, true, disk);
     set_block_on_bitmap(2, true, disk);
 
+    printf("INFO: Creating filesystem root.\n");
     struct meta_block root;
     int root_n = get_free_block(1, disk);
     memset(root.filename, 0, sizeof(root.filename));
@@ -91,7 +108,10 @@ int main(int argc, char **argv) {
     fseek(disk, 0, SEEK_SET);
     fwrite(&block_1, 1, sizeof(block_1), disk);
 
+    printf("INFO: Write done! Closing disk.\n");
     fclose(disk);
 
+    
+    printf("NeoFS filesystem successfully installed on %s.\n", disk_path);
     return 0;
 }

@@ -5,6 +5,7 @@
 
 #include "fs.h"
 #include "path.h"
+#include "global.h"
 
 int main(int argc, char **argv) {
     char *disk_path = "";
@@ -28,6 +29,10 @@ int main(int argc, char **argv) {
 
         if (!strncmp(argv[i], "trgt=", 5)) {
             target_path = argv[i] + 5;
+        }
+
+        if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
+            verbose = true;
         }
     }
 
