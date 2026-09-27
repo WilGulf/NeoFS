@@ -6,6 +6,7 @@
 bool verbose = false;
 
 int printfv(const char *fmt, ...) {
+    if (!verbose) return;
     va_list args;
     va_start(args, fmt);
     vprintf(fmt, args);
