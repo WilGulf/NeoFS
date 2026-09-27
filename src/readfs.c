@@ -8,11 +8,6 @@
 #include <memory.h>
 
 int main(int argc, char **argv) {
-    if (argc > 3) {
-        printf("Expected disk and path to object on disk. Got too many arguments.\n");
-        return -1;
-    }
-
     char *disk_path = "";
     char *target_path = "";
 
