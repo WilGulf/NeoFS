@@ -6,6 +6,8 @@ A simple implementation of a filesystem
 
 NeoFS began as a filesystem made just because I (the developer) just could not take my time to read the documentation of the FAT or ext filesystem to understand it. Instead in a more interesting way of learning how filesystems work NeoFS was created. The filesystem has then been implemented in my own micro kernel.
 
+Currently NeoFS supports: Dirs, read/write to files, removal of files. All of this can be tested with the tools compiled with the makefile.
+
 Now NeoFS is still actively being developed to be more usable as a filesystem.
 
 ## Testing NeoFS
