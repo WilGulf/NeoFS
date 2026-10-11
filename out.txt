@@ -1,0 +1,1059 @@
+Project Path: src
+
+Source Tree:
+
+```txt
+src
+├── copyfs.c
+├── fs.c
+├── fs.h
+├── global.c
+├── global.h
+├── mkfs.c
+├── path.c
+├── path.h
+├── readfs.c
+└── removefs.c
+
+```
+
+`copyfs.c`:
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <memory.h>
+
+#include "fs.h"
+#include "path.h"
+#include "global.h"
+
+int main(int argc, char **argv) {
+    char *disk_path = "";
+    char *flags = "";
+
+    char *input = "";
+    char *target_path = "";
+
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--disk") && i + 1 < argc) {
+            disk_path = argv[++i];
+        }
+
+        if (!strcmp(argv[i], "--flags") && i + 1 < argc) {
+            flags = argv[++i];
+        }
+
+        if (!strncmp(argv[i], "if=", 3)) {
+            input = argv[i] + 3;
+        }
+
+        if (!strncmp(argv[i], "trgt=", 5)) {
+            target_path = argv[i] + 5;
+        }
+
+        if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
+            verbose = true;
+        }
+    }
+
+    FILE *file = fopen(input, "rb");
+    if (!file) {
+        return -1;
+    }
+
+    fseek(file, 0L, SEEK_END);
+    long int res = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char file_buffer[res];
+    memset(&file_buffer, 0, sizeof(file_buffer));
+    fread(file_buffer, 1, sizeof(file_buffer), file);
+    fclose(file);   
+
+    FILE *disk = fopen(disk_path, "rb+");
+    if (disk) {
+        if (fs_init(disk) != 0) {
+            fclose(disk);
+            return -1;
+        }
+
+        int meta_block_n = get_path_meta_block(target_path, true, disk);
+        if (meta_block_n < 0) {
+            printf("FAILED TO OPEN FILE ON DISK\n");
+            return -1;
+        }
+
+        write_file(meta_block_n, file_buffer, sizeof(file_buffer), disk);
+
+        struct meta_block meta_block;
+        get_meta_block(meta_block_n, &meta_block, disk);
+        if (flags[0]) {
+            char *read = strchr(flags, 'r');
+            char *write = strchr(flags, 'w');
+            char *exec = strchr(flags, 'x');
+
+            if (read) {
+                meta_block.flags |= FLAG_R;
+            }
+            if (write) {
+                meta_block.flags |= FLAG_W;
+            }
+            if (exec) {
+                meta_block.flags |= FLAG_X;
+            }
+
+            write_block(meta_block_n, &meta_block, sizeof(meta_block), disk);
+        }
+
+
+        fclose(disk);
+    }
+
+    return 0;
+}
+```
+
+`fs.c`:
+
+```c
+#include "fs.h"
+#include "global.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <memory.h>
+#include <stdbool.h>
+
+uint32_t BLOCK_SIZE = 0;
+uint32_t DATA_SIZE = 0;
+
+int get_master_block(struct master_block *out, FILE *disk) {
+    printfv("Reading masterblock.\n");
+    fseek(disk, 0, SEEK_SET);
+    fread(out, 1, sizeof(struct master_block), disk);
+    return 0;
+}
+
+int get_meta_block(uint32_t block, struct meta_block *out, FILE *disk) {
+    printfv("Reading metablock at %d.\n", block);
+    fseek(disk, (BLOCK_SIZE * block), SEEK_SET);
+    fread(out, 1, sizeof(struct meta_block), disk);
+    return 0;
+}
+
+int get_block(uint32_t block, struct block *out, FILE *disk) {
+    printfv("Reading block at %d.\n", block);
+    fseek(disk, (BLOCK_SIZE * block), SEEK_SET);
+    fread(out, 1, sizeof(struct block), disk);
+    return 0;
+}
+
+uint32_t get_next_block(uint32_t block, FILE *disk) {
+    struct block read_block;
+    fseek(disk, (BLOCK_SIZE * block), SEEK_SET);
+    fread(&read_block, 1, sizeof(read_block), disk);
+    return read_block.next;
+}
+
+uint32_t get_next_neighbour(uint32_t block, FILE *disk) {
+    struct meta_block read_block;
+    fseek(disk, (BLOCK_SIZE * block), SEEK_SET);
+    fread(&read_block, 1, sizeof(read_block), disk);
+    return read_block.next;
+}
+
+int get_free_block(uint32_t start, FILE *disk) {
+    struct master_block master_block;
+    get_master_block(&master_block, disk);
+    struct meta_block bitmap;
+    get_meta_block(master_block.bitmap_metablock, &bitmap, disk);
+
+    unsigned char *buffer = malloc(bitmap.size);
+    read_file(&bitmap, buffer, disk);
+
+    for (uint32_t bit = start; bit < master_block.block_count; bit++) {
+        unsigned char mask = 1 << (bit % 8);
+        if (!(buffer[bit / 8] & mask)) {
+            free(buffer);
+            printfv("Found free block at %d.\n", bit);
+            return bit;
+        }
+    }
+
+    free(buffer);
+    
+    return -1;
+}
+
+int set_block_on_bitmap(uint32_t block, bool state, FILE *disk) {
+    struct master_block master_block;
+    get_master_block(&master_block, disk);
+    struct meta_block bitmap;
+    get_meta_block(master_block.bitmap_metablock, &bitmap, disk);
+
+    unsigned char *buffer = malloc(bitmap.size);
+    read_file(&bitmap, buffer, disk);
+
+    unsigned char mask = 1 << (block % 8);
+    if (state) {
+        buffer[block / 8] |= mask;
+        printfv("Marked block %d as used.\n", block);
+    } else {
+        buffer[block / 8] &= ~mask;
+        printfv("Marked block %d as free.\n", block);
+    }
+
+    write_file(master_block.bitmap_metablock, buffer, bitmap.size, disk);
+
+    free(buffer);
+
+    return 0;
+}
+
+int write_block(uint32_t block, void *val, size_t total, FILE *disk) {
+    printfv("Writing to block at %d.\n", block);
+    fseek(disk, (BLOCK_SIZE * block), SEEK_SET);
+    fwrite(val, 1, total, disk);
+    return BLOCK_SIZE;
+}
+
+int read_block(uint32_t block, void *out, FILE *disk) {
+    printfv("Reading to block at %d.\n", block);
+    int pos = (BLOCK_SIZE * block) + BLOCK_DATA_OFFSET;
+    int to_read = BLOCK_SIZE - BLOCK_DATA_OFFSET;
+
+    fseek(disk, pos, SEEK_SET);
+    fread(out, 1, to_read, disk);
+    return to_read;
+}
+
+int remove_block(uint32_t block, FILE *disk) {
+    struct block empty;
+    memset(&empty, 0, sizeof(empty));
+    write_block(block, &empty, sizeof(empty), disk);
+    set_block_on_bitmap(block, false, disk);
+    return 0;
+}
+
+int remove_meta_block(uint32_t block, FILE *disk) {
+    struct meta_block empty;
+    memset(&empty, 0, sizeof(empty));
+    write_block(block, &empty, sizeof(empty), disk);
+    set_block_on_bitmap(block, false, disk);
+    return 0;
+}
+
+int fs_init(FILE *disk) {
+    printfv("Reading disk for filesystem information.\n");
+
+    struct master_block master;
+    get_master_block(&master, disk);
+
+    if (master.magic != NEOFS_MAGIC) {
+        printf("ERROR: Magic of filesystem does not seem to match.\n");
+        return -1;
+    }
+
+    if (!master.block_size) {
+        return -1;
+    }
+
+    BLOCK_SIZE = master.block_size;
+    DATA_SIZE = master.block_size - BLOCK_DATA_OFFSET;
+
+    return 0;
+}
+
+int read_file(struct meta_block *file_meta_block, void *out, FILE *disk) {
+    int block = file_meta_block->start;
+    size_t remaining = file_meta_block->size;
+    int total_to_read = 0;
+
+    while (block && remaining > 0) {
+        size_t to_read = (remaining > DATA_SIZE) ? DATA_SIZE : remaining;
+        char buffer[DATA_SIZE];
+        int res = read_block(block, buffer, disk);
+        memcpy(out, buffer, to_read);
+
+        out += to_read;
+        remaining -= to_read;
+        total_to_read += to_read;
+        block = get_next_block(block, disk);;
+    }
+
+    return total_to_read;
+}
+
+int write_file(uint32_t file_meta_block_n, void *in, size_t total, FILE *disk) {
+    struct meta_block file_meta_block;
+    get_meta_block(file_meta_block_n, &file_meta_block, disk);
+    int block = file_meta_block.start;
+    if (!block) {
+        int new_block_n = get_free_block(1, disk);
+        if (new_block_n < 0) {
+            return -1;
+        }
+
+        struct block new_block;
+        /*new_block.status = BLOCK_STATUS_USED;*/ set_block_on_bitmap(new_block_n, true, disk);
+        new_block.next = 0;
+        write_block(new_block_n, &new_block, sizeof(new_block), disk);
+
+        file_meta_block.start = new_block_n;
+        write_block(file_meta_block_n, &file_meta_block, sizeof(file_meta_block), disk);
+        block = file_meta_block.start;
+    }
+
+    int blocks_written = 0;
+
+    int blocks_needed = total / DATA_SIZE;
+    if (total % DATA_SIZE) {
+        blocks_needed++;
+    }
+
+    int curr = block;
+    int prev = curr;
+    int blocks_allocated = 1;
+    while (blocks_allocated < blocks_needed) {
+        curr = get_next_block(curr, disk);
+        if (!curr) {
+            int new_block_n = get_free_block(1, disk);
+            if (new_block_n < 0) {
+                return -1;
+            }
+
+            struct block new_block;
+            /*new_block.status = BLOCK_STATUS_USED;*/set_block_on_bitmap(new_block_n, true, disk);
+            new_block.next = 0;
+            write_block(new_block_n, &new_block, sizeof(new_block), disk);
+
+            struct block prev_block;
+            get_block(prev, &prev_block, disk);
+            prev_block.next = new_block_n;
+            curr = new_block_n;
+            write_block(prev, &prev_block, sizeof(prev_block), disk);
+        }
+
+        prev = curr;
+        blocks_allocated++;
+    }
+
+    size_t remaining = total;
+    curr = block;
+    while (curr) {
+        char buffer[BLOCK_SIZE];
+        struct block curr_block;
+        get_block(curr, &curr_block, disk);
+        memset(buffer, 0, sizeof(buffer));
+        memcpy(&buffer, &curr_block, sizeof(curr_block));
+
+        size_t to_copy = (remaining > DATA_SIZE) ? DATA_SIZE : remaining;
+        memcpy(buffer + sizeof(curr_block), in, to_copy);
+        write_block(curr, buffer, BLOCK_SIZE, disk);
+        curr = curr_block.next;
+        in += to_copy;
+        remaining -= to_copy;
+        blocks_written++;
+    }
+
+    file_meta_block.size = total;
+    write_block(file_meta_block_n, &file_meta_block, sizeof(file_meta_block), disk);
+
+    return total;
+}
+
+int remove_file(uint32_t file_meta_block_n, FILE *disk) {
+    if (file_meta_block_n == 1) {
+        return -1;
+    }
+
+    struct meta_block file_meta_block;
+    get_meta_block(file_meta_block_n, &file_meta_block, disk);
+
+    struct meta_block parent;
+    get_meta_block(file_meta_block.parent, &parent, disk);
+    if (parent.start == file_meta_block_n) {
+        parent.start = file_meta_block.next;
+        write_block(file_meta_block.parent, &parent, sizeof(parent), disk);
+    } else {
+        struct meta_block child;
+        int child_n = parent.start;
+        get_meta_block(child_n, &child, disk);
+
+        bool found = false;
+        while (1) {
+            if (child.next == file_meta_block_n) {
+                child.next = file_meta_block.next;
+                write_block(child_n, &child, sizeof(child), disk);
+                found = true;
+                break;
+            }
+
+            if (!child.next) {
+                break;
+            }
+
+            child_n = child.next;
+            get_meta_block(child_n, &child, disk);
+        }
+
+        if (!found) {
+            return -1;
+        }
+    }
+
+    if (!file_meta_block.start) {
+        remove_meta_block(file_meta_block_n, disk);
+        return 0;
+    }
+
+    if (file_meta_block.is_dir) {
+        struct meta_block child;
+        int child_n = file_meta_block.start;
+        get_meta_block(file_meta_block.start, &child, disk);
+        while (child.next) {
+            int next = child.next;
+            remove_file(child_n, disk);
+            get_meta_block(next, &child, disk);
+            child_n = next;
+        }
+
+        remove_file(child_n, disk);
+
+        remove_meta_block(file_meta_block_n, disk);
+    } else {
+        struct block block;
+        int block_n = file_meta_block.start;
+        get_block(file_meta_block.start, &block, disk);
+        while (block.next) {
+            int next = block.next;
+            remove_block(block_n, disk);
+            get_block(next, &block, disk);
+            block_n = next;
+        }
+
+        remove_block(block_n, disk);
+
+        remove_meta_block(file_meta_block_n, disk);
+    }
+
+    return 0;
+}
+```
+
+`fs.h`:
+
+```h
+#ifndef FS_H
+#define FS_H
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+#define NEOFS_MAGIC 0x4E454F46
+
+#define MAX_PATH 256
+
+#define BLOCK_STATUS_FREE 0x00
+#define BLOCK_STATUS_USED 0x01
+
+#define FLAG_R 0b00000001
+#define FLAG_W 0b00000010
+#define FLAG_X 0b00000100
+#define FLAG_4 0b00001000
+#define FLAG_5 0b00010000
+#define FLAG_6 0b00100000
+#define FLAG_7 0b01000000
+#define FLAG_8 0b10000000
+
+struct master_block {
+    uint32_t magic;
+
+    uint32_t block_size;
+
+    uint32_t bitmap_metablock;
+
+    uint32_t first_block;
+    uint32_t block_count;
+} __attribute__((packed));
+
+struct meta_block {
+    char filename[8];
+    char ext[3];
+
+    uint8_t is_dir;
+    uint8_t flags;
+    uint32_t size;
+
+    uint32_t start;
+    uint32_t next;
+    uint32_t parent;
+} __attribute__((packed));
+
+struct block {
+    uint32_t next;
+} __attribute__((packed));
+
+struct path_root {
+    char drive_id;
+    struct path_part *first;
+};
+
+struct path_part {
+    const char *part;
+    struct path_part *next;
+};
+
+#define BLOCK_DATA_OFFSET (sizeof(struct block))
+extern uint32_t BLOCK_SIZE;
+extern uint32_t DATA_SIZE;
+
+int fs_init(FILE *disk);
+
+int get_master_block(struct master_block *out, FILE *disk);
+int get_meta_block(uint32_t block, struct meta_block *out, FILE *disk);
+int get_block(uint32_t block, struct block *out, FILE *disk);
+
+int set_block_on_bitmap(uint32_t block, bool state, FILE *disk);
+
+uint32_t get_next_block(uint32_t block, FILE *disk);
+uint32_t get_next_neighbour(uint32_t block, FILE *disk);
+
+int get_free_block(uint32_t start, FILE *disk);
+
+int write_block(uint32_t block, void *val, size_t total, FILE *disk);
+int read_block(uint32_t block, void *out, FILE *disk);
+
+int read_file(struct meta_block *file_meta_block, void *out, FILE *disk);
+int write_file(uint32_t file_meta_block_n, void *in, size_t total, FILE *disk);
+int remove_file(uint32_t file_meta_block_n, FILE *disk);
+
+#endif
+```
+
+`global.c`:
+
+```c
+#include "global.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+
+bool verbose = false;
+
+int printfv(const char *fmt, ...) {
+    if (!verbose) return 1;
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    return 0;
+}
+```
+
+`global.h`:
+
+```h
+#ifndef GLOBAL_H
+#define GLOBAL_H
+
+#include <stdbool.h>
+
+int printfv(const char *fmt, ...);
+extern bool verbose;
+
+#endif
+```
+
+`mkfs.c`:
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <memory.h>
+
+#include "fs.h"
+#include "global.h"
+
+#define DEFAULT_BLOCK_SIZE 1024
+
+#define DISK_SIZE (1024 * 1024)
+
+int main(int argc, char **argv) {
+    char *disk_path = "";
+    uint32_t target_block_size = DEFAULT_BLOCK_SIZE;
+
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--disk") && i + 1 < argc) {
+            disk_path = argv[++i];
+        }
+
+        if (!strcmp(argv[i], "--block_size") && i + 1 < argc) {
+            target_block_size = atoi(argv[++i]);
+        }
+        
+        if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
+            verbose = true;
+        }
+    }
+
+    if (
+        target_block_size < (sizeof(struct block) + 64) ||
+        target_block_size < (sizeof(struct meta_block) + 64) ||
+        target_block_size < (sizeof(struct master_block) + 64)
+    ) {
+        printf("ERROR: Provided blocksize is too small to create a usable filesystem.\n");
+        return 0;
+    }
+
+    FILE *disk = fopen(disk_path, "rb+");
+    if (!disk) {
+        printf("ERROR: Failed to open disk image.\n");
+        return -1;
+    }
+
+    fseek(disk, DISK_SIZE - 1, SEEK_SET);
+    fputc(0, disk);
+
+    BLOCK_SIZE = target_block_size;
+    DATA_SIZE = BLOCK_SIZE - BLOCK_DATA_OFFSET;
+    uint32_t total_blocks =  DISK_SIZE / BLOCK_SIZE;
+
+    struct master_block block_1;
+
+    block_1.first_block = 1;
+    block_1.magic = NEOFS_MAGIC;
+    block_1.block_count = total_blocks;
+    printf("INFO: Total blocks on disk: %d.\n", total_blocks);
+    block_1.block_size = BLOCK_SIZE;
+    block_1.bitmap_metablock = 1;
+
+    fseek(disk, 0, SEEK_SET);
+    fwrite(&block_1, 1, sizeof(block_1), disk);
+
+    printf("INFO: Creating filesystem bitmap.\n");
+    struct meta_block bitmap;
+    memset(bitmap.filename, 0, sizeof(bitmap.filename));
+    memset(bitmap.ext, 0, sizeof(bitmap.ext));
+    strcpy(bitmap.filename, "bitmap");
+    
+    bitmap.is_dir = 0;
+    bitmap.next = 0;
+    bitmap.size = (total_blocks + 7) / 8;
+    bitmap.flags = 0;
+    bitmap.start = 2;
+    bitmap.parent = 0;
+
+    write_block(1, &bitmap, sizeof(bitmap), disk);
+
+    struct block bitmap_block;
+    memset(&bitmap_block, 0, sizeof(bitmap_block));
+    write_block(2, &bitmap_block, sizeof(bitmap_block), disk);
+
+    set_block_on_bitmap(0, true, disk);
+    set_block_on_bitmap(1, true, disk);
+    set_block_on_bitmap(2, true, disk);
+
+    printf("INFO: Creating filesystem root.\n");
+    struct meta_block root;
+    int root_n = get_free_block(1, disk);
+    memset(root.filename, 0, sizeof(root.filename));
+    memset(root.ext, 0, sizeof(root.ext));
+    strcpy(root.filename, "root");
+    root.is_dir = 1;
+
+    root.next = 0;
+    root.size = 0;
+    root.flags = 0;
+    root.start = 0;
+    root.parent = 0;
+
+    write_block(root_n, &root, sizeof(root), disk);
+    set_block_on_bitmap(root_n, true, disk);
+
+    block_1.first_block = root_n;
+    fseek(disk, 0, SEEK_SET);
+    fwrite(&block_1, 1, sizeof(block_1), disk);
+
+    printf("INFO: Write done! Closing disk.\n");
+    fclose(disk);
+
+    
+    printf("NeoFS filesystem successfully installed on %s.\n", disk_path);
+    return 0;
+}
+```
+
+`path.c`:
+
+```c
+#include "path.h"
+#include "fs.h"
+
+#include <string.h>
+#include <stdbool.h>
+#include <stdlib.h>
+
+struct path_part *string_to_path(char *path) {
+    struct path_part *path_part = malloc(sizeof(struct path_part));
+
+    struct path_part *curr = 0;
+    struct path_part *prev = 0;
+
+    char *p = strtok(path, "/");
+
+    path_part->part = p;
+    path_part->next = 0;
+    prev = path_part;
+    p = strtok(NULL, "/");
+    while (p != NULL) {
+        curr = malloc(sizeof(struct path_part));
+        curr->part = p;
+        curr->next = 0;
+        prev->next = curr;
+        prev = curr;
+
+        p = strtok(NULL, "/");
+    }
+
+    return path_part;
+}
+
+void free_path_part(struct path_part *path_part) {
+    struct path_part *part = path_part;
+    while (part) {
+        struct path_part *next_part = part->next;
+        free(part); 
+        part = next_part;
+    }
+}
+
+static int name_matches(struct meta_block *meta_block, const char *part) {
+    char buffer[strlen(part) + 1];
+    strcpy(buffer, part);
+
+    char *dot = strrchr(buffer, '.');
+    if (dot != 0) {
+        *dot = '\0';
+
+        char *filename = buffer;
+        char *ext = dot + 1;
+
+        if (strncmp(filename, meta_block->filename, sizeof(meta_block->filename))) {
+            return false;
+        }
+        if (strncmp(ext, meta_block->ext, sizeof(meta_block->ext))) {
+            return false;
+        }
+
+        return true;
+    } else {
+        if (strncmp(buffer, meta_block->filename, sizeof(meta_block->filename))) {
+            return false;
+        }
+
+        return true;
+    }
+}
+
+int create_meta_block(int parent, bool is_dir, const char *name, FILE *disk) {
+    int new_block_n = get_free_block(1, disk);
+    if (new_block_n < 0) {
+        return -1;
+    }
+
+    struct meta_block new_block;
+    memset(new_block.filename, 0, sizeof(new_block.filename));
+    memset(new_block.ext, 0, sizeof(new_block.ext));
+
+    char buffer[strlen(name) + 1];
+    strcpy(buffer, name);
+    char *dot = strrchr(buffer, '.');
+    if (dot != 0) {
+        *dot = '\0';
+
+        char *ext = dot + 1;
+        size_t ext_len = (strlen(ext) > sizeof(new_block.ext)) ? sizeof(new_block.ext) : strlen(ext);
+        strncpy(new_block.ext, ext, ext_len);
+    }
+
+    char *filename = buffer;
+    size_t filename_len = (strlen(filename) > sizeof(new_block.filename)) ? sizeof(new_block.filename) : strlen(filename);
+    strncpy(new_block.filename, filename, filename_len);
+
+    new_block.is_dir = is_dir;
+    new_block.next = 0;
+    new_block.parent = parent;
+    new_block.size = 0;
+    new_block.start = 0;
+    new_block.flags = 0;
+    set_block_on_bitmap(new_block_n, true, disk);
+
+    write_block(new_block_n, &new_block, sizeof(new_block), disk);
+
+    struct meta_block parent_block;
+    get_meta_block(parent, &parent_block, disk);
+    
+    if (!parent_block.start) {
+        parent_block.start = new_block_n;
+        write_block(parent, &parent_block, sizeof(parent_block), disk);
+    } else {
+        struct meta_block child_block;
+        get_meta_block(parent_block.start, &child_block, disk);
+
+        int prev_child_block_n = parent_block.start;
+        while (child_block.next) {
+            prev_child_block_n = child_block.next;
+            get_meta_block(child_block.next, &child_block, disk);
+        }
+
+        get_meta_block(prev_child_block_n, &child_block, disk);
+        child_block.next = new_block_n;
+        write_block(prev_child_block_n, &child_block, sizeof(child_block), disk);
+    }
+
+    return new_block_n;
+}
+
+int get_path_meta_block(char *path, bool allow_creation, FILE *disk) {
+    int res = 0;
+
+    struct master_block master_block;
+    get_master_block(&master_block, disk);
+    
+    struct meta_block root;
+    get_meta_block(master_block.first_block, &root, disk);
+    
+    struct path_part *path_part = string_to_path(path);
+    if (!path_part->part) {
+        res = -1;
+        goto out;
+    }
+
+    struct meta_block curr;
+    struct meta_block dir;
+
+    int dir_n = master_block.first_block; // Dir being searched
+    int curr_n = root.start; // Inspected file in dir
+
+    get_meta_block(master_block.first_block, &dir, disk);
+
+    if (dir.start) {
+        curr_n = dir.start;
+        get_meta_block(curr_n, &curr, disk);
+    }
+
+    while (path_part->part) {
+        bool found = false;
+        while (1) {
+            if (!dir.start) {
+                break;
+            }
+
+            if (name_matches(&curr, path_part->part)) {
+                found = true;
+                break;
+            }
+
+            if (!curr.next) {
+                break;
+            }
+
+            curr_n = curr.next;
+            get_meta_block(curr_n, &curr, disk);
+        }
+
+        if (found && path_part->next) {
+            if (!curr.is_dir) {
+                res = -1;
+                goto out;
+            }
+
+            dir_n = curr_n; // Jump into new dir
+            get_meta_block(dir_n, &dir, disk);
+
+            curr_n = dir.start; // Start next search on first child in new dir
+            if (curr_n) {
+                get_meta_block(curr_n, &curr, disk);
+            }
+
+            path_part = path_part->next; // Go to the next path_part
+            continue;
+        }
+
+        if (found && !path_part->next) {
+            res = curr_n; // File found
+            goto out;
+        }
+
+        if (!found && path_part->next) {
+            if (!allow_creation) {
+                res = -1;
+                goto out;
+            }
+
+            int new_dir = create_meta_block(dir_n, true, path_part->part, disk);
+            
+            dir_n = new_dir;
+            get_meta_block(dir_n, &dir, disk);
+            curr_n = dir.start;
+            path_part = path_part->next;
+            continue;
+        }
+
+        if (!found && !path_part->next) {
+            if (!allow_creation) {
+                res = -1;
+                goto out;
+            }
+
+            int new_file = create_meta_block(dir_n, false, path_part->part, disk);
+            res = new_file;
+            goto out;
+        }
+    }
+
+out:
+    free_path_part(path_part);
+    return res;
+}
+```
+
+`path.h`:
+
+```h
+#ifndef PATH_H
+#define PATH_H
+
+#include <stdio.h>
+#include <stdbool.h>
+
+int get_path_meta_block(char *path, bool allow_creation, FILE *disk);
+
+#endif
+```
+
+`readfs.c`:
+
+```c
+#include "fs.h"
+#include "path.h"
+#include "global.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <memory.h>
+
+int main(int argc, char **argv) {
+    char *disk_path = "";
+    char *target_path = "";
+
+    bool disk_found = false;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--disk") && i + 1 < argc) {
+            disk_path = argv[++i];
+            disk_found = true;
+        }
+
+        if (disk_found && !strstr(argv[i], "--")) {
+            target_path = argv[i];
+        }
+
+        if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
+            verbose = true;
+        }
+    }
+
+    if (disk_path[0] && target_path[0]) {
+        FILE *disk = fopen(disk_path, "rb");
+        if (!disk) {
+            return -1;
+        }
+
+        if (fs_init(disk) != 0) {
+            fclose(disk);
+            return -1;
+        }
+
+        int meta_block = get_path_meta_block(target_path, false, disk);
+        if (meta_block < 0) {
+            return -1;
+        }
+        
+        struct meta_block file_meta_block;
+        get_meta_block(meta_block, &file_meta_block, disk);
+        char buffer[file_meta_block.size + 1];
+        read_file(&file_meta_block, buffer, disk);
+
+        buffer[sizeof(buffer) - 1] = 0x00;
+
+        printf("%s", buffer);
+    }
+
+    return 0;
+}
+```
+
+`removefs.c`:
+
+```c
+#include "fs.h"
+#include "path.h"
+#include "global.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <memory.h>
+
+int main(int argc, char **argv) {
+    char *disk_path = "";
+    char *target_path = "";
+
+    bool disk_found = false;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--disk") && i + 1 < argc) {
+            disk_path = argv[++i];
+            disk_found = true;
+        }
+
+        if (disk_found && !strstr(argv[i], "--")) {
+            target_path = argv[i];
+        }
+
+        if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
+            verbose = true;
+        }
+    }
+
+    if (disk_path[0] && target_path[0]) {
+        FILE *disk = fopen(disk_path, "rb+");
+        if (!disk) {
+            return -1;
+        }
+
+        if (fs_init(disk) != 0) {
+            fclose(disk);
+            return -1;
+        }
+
+        int meta_block = get_path_meta_block(target_path, false, disk);
+        if (meta_block < 0) {
+            return -1;
+        }
+        
+        remove_file(meta_block, disk);
+
+        fclose(disk);
+    }
+
+    return 0;
+}
+```

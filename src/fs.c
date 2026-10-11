@@ -222,7 +222,7 @@ int write_file(uint32_t file_meta_block_n, void *in, size_t total, FILE *disk) {
 
     size_t remaining = total;
     curr = block;
-    while (curr) {
+    while (curr && remaining > 0) {
         char buffer[BLOCK_SIZE];
         struct block curr_block;
         get_block(curr, &curr_block, disk);
